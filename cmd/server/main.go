@@ -29,6 +29,12 @@ func main() {
 
 	// Load configuration
 	cfg := config.Load()
+	if err := cfg.Server.Validate(); err != nil {
+		log.Fatalf("Invalid server configuration: %v", err)
+	}
+	if err := cfg.Auth.Validate(); err != nil {
+		log.Fatalf("Invalid authentication configuration: %v", err)
+	}
 
 	// Set Gin mode
 	gin.SetMode(cfg.Server.Mode)
@@ -48,23 +54,34 @@ func main() {
 
 	// Initialize usecases
 	authUsecaseConfig := usecase.AuthUsecaseConfig{
-		TokenDuration: cfg.Auth.TokenDuration,
-		BcryptCost:    cfg.Auth.BcryptCost,
+		AccessTokenDuration:  cfg.Auth.AccessTokenDuration,
+		RefreshTokenDuration: cfg.Auth.RefreshTokenDuration,
+		BcryptCost:           cfg.Auth.BcryptCost,
+		ActiveKeyID:          cfg.Auth.ActiveKeyID,
+		JWTKeys:              cfg.Auth.JWTKeys,
 	}
 	authUsecase := usecase.NewAuthUsecase(userRepo, sessionRepo, authUsecaseConfig)
 
 	// Initialize handlers
 	authHandler := handler.NewAuthHandler(authUsecase)
+	adminRepository := postgres.NewAdminRepository(db)
+	adminUsecase := usecase.NewAdminUsecase(adminRepository, cfg.Auth.BcryptCost)
+	adminHandler := handler.NewAdminHandler(adminUsecase)
 
 	// Initialize middleware
 	authMiddleware := middleware.NewAuthMiddleware(authUsecase)
 
 	// Initialize router
 	r := router.NewRouter(router.Config{
-		AuthHandler:    authHandler,
-		AuthUsecase:    authUsecase,
-		AuthMiddleware: authMiddleware,
+		AuthHandler:       authHandler,
+		AdminHandler:      adminHandler,
+		AuthMiddleware:    authMiddleware,
+		EnforceHTTPS:      cfg.Server.Mode == "release",
+		TrustedProxyCIDRs: cfg.Server.TrustedProxyCIDRs,
 	})
+	if err := r.SetTrustedProxies(cfg.Server.TrustedProxyCIDRs); err != nil {
+		log.Fatalf("Invalid trusted proxy configuration: %v", err)
+	}
 
 	// Create HTTP server
 	srv := &http.Server{
@@ -78,8 +95,14 @@ func main() {
 	// Start server in a goroutine
 	go func() {
 		log.Printf("Starting server on port %s", cfg.Server.Port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start server: %v", err)
+		var serveErr error
+		if cfg.Server.TLSCertFile != "" {
+			serveErr = srv.ListenAndServeTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
+		} else {
+			serveErr = srv.ListenAndServe()
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", serveErr)
 		}
 	}()
 

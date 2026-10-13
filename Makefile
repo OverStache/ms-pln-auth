@@ -1,16 +1,18 @@
-.PHONY: build run test clean deps
+.PHONY: build run test clean deps db-setup db-seed db-migrate bootstrap-admin
+
+DB_NAME ?= auth_db
 
 # Build the application
 build:
-	go build -o bin/server ./cmd/server
+	go build -mod=readonly -o bin/server ./cmd/server
 
 # Run the application
 run:
-	go run ./cmd/server
+	go run -mod=readonly ./cmd/server
 
 # Run tests
 test:
-	go test -v ./...
+	go test -mod=readonly -v ./...
 
 # Clean build artifacts
 clean:
@@ -27,8 +29,19 @@ dev:
 
 # Database setup - run the DDL
 db-setup:
-	psql -h localhost -U postgres -d auth_db -f ddl/init.sql
+	set -a; . ./.env; set +a; PGSSLMODE="$$DB_SSLMODE" PGPASSWORD="$$DB_PASSWORD" psql -X -w -h "$$DB_HOST" -p "$$DB_PORT" -U "$$DB_USER" -d "$$DB_NAME" -v ON_ERROR_STOP=1 -f ddl/init.sql
+
+# Development/test data only; seed.sql uses shared demo credentials and is not idempotent.
+db-seed:
+	set -a; . ./.env; set +a; PGSSLMODE="$$DB_SSLMODE" PGPASSWORD="$$DB_PASSWORD" psql -X -w -h "$$DB_HOST" -p "$$DB_PORT" -U "$$DB_USER" -d "$$DB_NAME" -v ON_ERROR_STOP=1 -f ddl/seed.sql
+
+db-migrate:
+	set -a; . ./.env; set +a; PGSSLMODE="$$DB_SSLMODE" PGPASSWORD="$$DB_PASSWORD" psql -X -w -h "$$DB_HOST" -p "$$DB_PORT" -U "$$DB_USER" -d "$$DB_NAME" -v ON_ERROR_STOP=1 -f ddl/migrations/001_refresh_token_session.sql
+
+# Set BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD in the environment first.
+bootstrap-admin:
+	go run -mod=readonly ./cmd/bootstrap-admin
 
 # Create database
 db-create:
-	psql -h localhost -U postgres -c "CREATE DATABASE auth_db;"
+	psql -h localhost -U postgres -c "CREATE DATABASE $(DB_NAME);"

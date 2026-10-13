@@ -11,17 +11,38 @@ type SessionRepository interface {
 	// Create creates a new session
 	Create(ctx context.Context, session *entity.Session) error
 
-	// GetByToken retrieves a session by token
-	GetByToken(ctx context.Context, token string) (*entity.Session, error)
+	// CreateSessionWithRefresh creates a login session and its refresh token atomically.
+	CreateSessionWithRefresh(ctx context.Context, session *entity.Session, refresh *entity.RefreshToken) error
+
+	// GetByTokenHash retrieves a session by its token hash
+	GetByTokenHash(ctx context.Context, tokenHash string) (*entity.Session, error)
 
 	// GetByUserID retrieves all sessions for a user
-	GetByUserID(ctx context.Context, userID int64) ([]*entity.Session, error)
+	GetByUserID(ctx context.Context, userID string) ([]*entity.Session, error)
 
-	// RevokeByToken revokes a session by token
-	RevokeByToken(ctx context.Context, token string) error
+	// RevokeByTokenHash revokes a session by its token hash
+	RevokeByTokenHash(ctx context.Context, tokenHash, ipAddress string) error
 
 	// RevokeAllByUserID revokes all sessions for a user
-	RevokeAllByUserID(ctx context.Context, userID int64) error
+	RevokeAllByUserID(ctx context.Context, userID string) error
+
+	// Touch updates the last-active timestamp for a session.
+	Touch(ctx context.Context, tokenHash string) error
+
+	// CreateRefreshToken stores a hashed refresh token associated with a login session.
+	CreateRefreshToken(ctx context.Context, token *entity.RefreshToken) error
+
+	// GetRefreshTokenByHash retrieves a refresh token by its hash.
+	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (*entity.RefreshToken, error)
+
+	// RotateRefreshToken atomically revokes and replaces a refresh token.
+	RotateRefreshToken(ctx context.Context, oldHash string, replacement *entity.RefreshToken) (userID string, reused bool, err error)
+
+	// RevokeRefreshToken revokes a refresh token by hash.
+	RevokeRefreshToken(ctx context.Context, tokenHash, ipAddress string) error
+
+	// RevokeAllForUser revokes every access and refresh session token for a user.
+	RevokeAllForUser(ctx context.Context, userID, ipAddress string) error
 
 	// DeleteExpired deletes all expired sessions
 	DeleteExpired(ctx context.Context) error

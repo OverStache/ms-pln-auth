@@ -1,254 +1,260 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"ms-pln-auth/internal/delivery/http/middleware"
+	"ms-pln-auth/internal/domain/entity"
 	"ms-pln-auth/internal/usecase"
 )
 
-// AuthHandler handles authentication HTTP requests
+const refreshCookieName = "refresh_token"
+
 type AuthHandler struct {
 	authUsecase usecase.AuthUsecase
+	limiter     *middleware.RateLimiter
 }
 
-// NewAuthHandler creates a new AuthHandler
 func NewAuthHandler(authUsecase usecase.AuthUsecase) *AuthHandler {
 	return &AuthHandler{
 		authUsecase: authUsecase,
+		limiter:     middleware.NewRateLimiter(10, time.Minute),
 	}
 }
 
-// LoginRequest represents the login request body
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
+	Username string `json:"username" binding:"required,min=3,max=30"`
 	Password string `json:"password" binding:"required"`
 }
 
-// LoginResponse represents the login response body
-type LoginResponse struct {
-	Token     string `json:"token"`
-	ExpiresAt string `json:"expires_at"`
-	User      struct {
-		ID       int64  `json:"id"`
-		Username string `json:"username"`
-		Email    string `json:"email"`
-	} `json:"user"`
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }
 
-// ErrorResponse represents an error response
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required"`
+	NewPassword     string `json:"new_password" binding:"required,min=8,max=72"`
+}
+
+type TokenResponse struct {
+	AccessToken string       `json:"access_token"`
+	ExpiresAt   time.Time    `json:"expires_at"`
+	User        *entity.User `json:"user,omitempty"`
+}
+
+type APIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message,omitempty"`
+	Error APIError `json:"error"`
 }
 
-// SuccessResponse represents a success response
 type SuccessResponse struct {
 	Message string `json:"message"`
 }
 
-// Login handles user login
-// @Summary Login user
-// @Description Authenticate user with username and password
-// @Tags auth
-// @Accept json
-// @Produce json
-// @Param request body LoginRequest true "Login credentials"
-// @Success 200 {object} LoginResponse
-// @Failure 400 {object} ErrorResponse
-// @Failure 401 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "invalid_request",
-			Message: "Invalid request body",
-		})
+		writeError(c, http.StatusBadRequest, "AUTH_INVALID_REQUEST", "Invalid request body")
+		return
+	}
+	username := strings.ToLower(strings.TrimSpace(req.Username))
+	ipAddress := requestIPAddress(c)
+	if !h.limiter.Allow("login:ip:"+ipAddress, "login:user:"+username) {
+		writeError(c, http.StatusTooManyRequests, "AUTH_RATE_LIMITED", "Too many login attempts")
 		return
 	}
 
-	result, err := h.authUsecase.Login(c.Request.Context(), req.Username, req.Password)
+	result, err := h.authUsecase.Login(c.Request.Context(), username, req.Password, requestMetadata(c))
 	if err != nil {
-		if errors.Is(err, usecase.ErrInvalidCredentials) {
-			c.JSON(http.StatusUnauthorized, ErrorResponse{
-				Error:   "invalid_credentials",
-				Message: "Invalid username or password",
-			})
-			return
+		switch {
+		case errors.Is(err, usecase.ErrAccountLocked):
+			writeError(c, http.StatusLocked, "AUTH_ACCOUNT_LOCKED", "Account is temporarily locked")
+		case errors.Is(err, usecase.ErrInvalidCredentials):
+			writeError(c, http.StatusUnauthorized, "AUTH_INVALID_CREDENTIALS", "Username or password is incorrect")
+		default:
+			writeError(c, http.StatusInternalServerError, "AUTH_INTERNAL_ERROR", "An error occurred during login")
 		}
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error:   "internal_error",
-			Message: "An error occurred during login",
-		})
 		return
 	}
-
-	response := LoginResponse{
-		Token:     result.Token,
-		ExpiresAt: result.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
-	}
-	response.User.ID = result.User.ID
-	response.User.Username = result.User.Username
-	response.User.Email = result.User.Email
-
-	c.JSON(http.StatusOK, response)
-}
-
-// Logout handles user logout
-// @Summary Logout user
-// @Description Invalidate the current session token
-// @Tags auth
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Success 200 {object} SuccessResponse
-// @Failure 401 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /api/v1/auth/logout [post]
-func (h *AuthHandler) Logout(c *gin.Context) {
-	token := extractToken(c)
-	if token == "" {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{
-			Error:   "unauthorized",
-			Message: "No token provided",
-		})
-		return
-	}
-
-	err := h.authUsecase.Logout(c.Request.Context(), token)
-	if err != nil {
-		if errors.Is(err, usecase.ErrInvalidToken) {
-			c.JSON(http.StatusUnauthorized, ErrorResponse{
-				Error:   "invalid_token",
-				Message: "Invalid or expired token",
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error:   "internal_error",
-			Message: "An error occurred during logout",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, SuccessResponse{
-		Message: "Successfully logged out",
+	setRefreshCookie(c, result.RefreshToken, result.RefreshExpiresAt)
+	c.JSON(http.StatusOK, TokenResponse{
+		AccessToken: result.AccessToken, ExpiresAt: result.ExpiresAt, User: result.User,
 	})
 }
 
-// RegisterRequest represents the registration request body
-type RegisterRequest struct {
-	Username string `json:"username" binding:"required,min=3,max=100"`
-	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required,min=8"`
-}
-
-// RegisterResponse represents the registration response body
-type RegisterResponse struct {
-	Message string `json:"message"`
-	User    struct {
-		ID       int64  `json:"id"`
-		Username string `json:"username"`
-		Email    string `json:"email"`
-	} `json:"user"`
-}
-
-// Register handles user registration
-// @Summary Register new user
-// @Description Create a new user account
-// @Tags auth
-// @Accept json
-// @Produce json
-// @Param request body RegisterRequest true "Registration data"
-// @Success 201 {object} RegisterResponse
-// @Failure 400 {object} ErrorResponse
-// @Failure 409 {object} ErrorResponse
-// @Failure 500 {object} ErrorResponse
-// @Router /api/v1/auth/register [post]
-func (h *AuthHandler) Register(c *gin.Context) {
-	var req RegisterRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "invalid_request",
-			Message: "Invalid request body: " + err.Error(),
-		})
-		return
-	}
-
-	usecaseReq := &usecase.RegisterRequest{
-		Username: req.Username,
-		Email:    req.Email,
-		Password: req.Password,
-	}
-
-	user, err := h.authUsecase.Register(c.Request.Context(), usecaseReq)
-	if err != nil {
-		if errors.Is(err, usecase.ErrUserAlreadyExists) {
-			c.JSON(http.StatusConflict, ErrorResponse{
-				Error:   "user_exists",
-				Message: "Username or email already exists",
-			})
+func (h *AuthHandler) Refresh(c *gin.Context) {
+	var req RefreshRequest
+	if c.Request.Body != nil {
+		if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(c, http.StatusBadRequest, "AUTH_INVALID_REQUEST", "Invalid request body")
 			return
 		}
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error:   "internal_error",
-			Message: "An error occurred during registration",
-		})
+	}
+	token := req.RefreshToken
+	if token == "" {
+		if cookie, err := c.Cookie(refreshCookieName); err == nil {
+			token = cookie
+		}
+	}
+	if token == "" {
+		writeError(c, http.StatusUnauthorized, "AUTH_INVALID_TOKEN", "Refresh token is required")
+		return
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	if !h.limiter.Allow("refresh:ip:"+requestIPAddress(c), "refresh:token:"+hex.EncodeToString(tokenHash[:])) {
+		writeError(c, http.StatusTooManyRequests, "AUTH_RATE_LIMITED", "Too many refresh attempts")
 		return
 	}
 
-	response := RegisterResponse{
-		Message: "User registered successfully",
+	result, err := h.authUsecase.Refresh(c.Request.Context(), token, requestMetadata(c))
+	if err != nil {
+		switch {
+		case errors.Is(err, usecase.ErrRefreshReuse):
+			clearRefreshCookie(c)
+			writeError(c, http.StatusUnauthorized, "AUTH_REFRESH_REUSE", "Refresh token reuse detected; all sessions were revoked")
+		case errors.Is(err, usecase.ErrInvalidToken):
+			clearRefreshCookie(c)
+			writeError(c, http.StatusUnauthorized, "AUTH_INVALID_TOKEN", "Invalid or expired refresh token")
+		default:
+			writeError(c, http.StatusInternalServerError, "AUTH_INTERNAL_ERROR", "An error occurred while refreshing the session")
+		}
+		return
 	}
-	response.User.ID = user.ID
-	response.User.Username = user.Username
-	response.User.Email = user.Email
-
-	c.JSON(http.StatusCreated, response)
+	setRefreshCookie(c, result.RefreshToken, result.RefreshExpiresAt)
+	c.JSON(http.StatusOK, TokenResponse{
+		AccessToken: result.AccessToken, ExpiresAt: result.ExpiresAt, User: result.User,
+	})
 }
 
-// Me returns the current authenticated user
-// @Summary Get current user
-// @Description Get the currently authenticated user's information
-// @Tags auth
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Success 200 {object} object
-// @Failure 401 {object} ErrorResponse
-// @Router /api/v1/auth/me [get]
+func (h *AuthHandler) Logout(c *gin.Context) {
+	accessToken := extractToken(c)
+	refreshToken := refreshTokenFromRequest(c)
+	userID, _ := c.Get("user_id")
+	id, _ := userID.(string)
+	if err := h.authUsecase.Logout(c.Request.Context(), id, accessToken, refreshToken, requestIPAddress(c)); err != nil {
+		if errors.Is(err, usecase.ErrInvalidToken) {
+			writeError(c, http.StatusUnauthorized, "AUTH_INVALID_TOKEN", "Invalid or expired token")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "AUTH_INTERNAL_ERROR", "An error occurred during logout")
+		return
+	}
+	clearRefreshCookie(c)
+	c.JSON(http.StatusOK, SuccessResponse{Message: "Successfully logged out"})
+}
+
+func (h *AuthHandler) LogoutAll(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	id, ok := userID.(string)
+	if !ok || id == "" {
+		writeError(c, http.StatusUnauthorized, "AUTH_UNAUTHORIZED", "User is not authenticated")
+		return
+	}
+	if err := h.authUsecase.LogoutAll(c.Request.Context(), id, requestIPAddress(c)); err != nil {
+		writeError(c, http.StatusInternalServerError, "AUTH_INTERNAL_ERROR", "Unable to revoke sessions")
+		return
+	}
+	clearRefreshCookie(c)
+	c.JSON(http.StatusOK, SuccessResponse{Message: "All sessions revoked"})
+}
+
+func (h *AuthHandler) ChangePassword(c *gin.Context) {
+	var req ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "AUTH_INVALID_REQUEST", "Invalid request body")
+		return
+	}
+	userID, _ := c.Get("user_id")
+	id, ok := userID.(string)
+	if !ok || id == "" {
+		writeError(c, http.StatusUnauthorized, "AUTH_UNAUTHORIZED", "User is not authenticated")
+		return
+	}
+	err := h.authUsecase.ChangePassword(c.Request.Context(), id, req.CurrentPassword, req.NewPassword, requestIPAddress(c))
+	switch {
+	case errors.Is(err, usecase.ErrPasswordPolicy):
+		writeError(c, http.StatusBadRequest, "AUTH_PASSWORD_POLICY", err.Error())
+	case errors.Is(err, usecase.ErrInvalidCredentials):
+		writeError(c, http.StatusUnauthorized, "AUTH_INVALID_CREDENTIALS", "Current password is incorrect")
+	case err != nil:
+		writeError(c, http.StatusInternalServerError, "AUTH_INTERNAL_ERROR", "Unable to change password")
+	default:
+		clearRefreshCookie(c)
+		c.JSON(http.StatusOK, SuccessResponse{Message: "Password changed; sign in again"})
+	}
+}
+
 func (h *AuthHandler) Me(c *gin.Context) {
-	// User is set by auth middleware
 	user, exists := c.Get("user")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{
-			Error:   "unauthorized",
-			Message: "User not authenticated",
-		})
+		writeError(c, http.StatusUnauthorized, "AUTH_UNAUTHORIZED", "User is not authenticated")
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"user": user})
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"user": user,
+func refreshTokenFromRequest(c *gin.Context) string {
+	var req RefreshRequest
+	if err := c.ShouldBindJSON(&req); err == nil && req.RefreshToken != "" {
+		return req.RefreshToken
+	}
+	if token, err := c.Cookie(refreshCookieName); err == nil {
+		return token
+	}
+	return ""
+}
+
+func setRefreshCookie(c *gin.Context, token string, expiresAt time.Time) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name: refreshCookieName, Value: token, Path: "/api/v1/auth",
+		Expires: expiresAt, MaxAge: int(time.Until(expiresAt).Seconds()),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
 	})
 }
 
-// extractToken extracts the bearer token from the Authorization header
+func clearRefreshCookie(c *gin.Context) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name: refreshCookieName, Value: "", Path: "/api/v1/auth",
+		MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func requestMetadata(c *gin.Context) usecase.RequestMetadata {
+	return usecase.RequestMetadata{IPAddress: requestIPAddress(c), UserAgent: c.Request.UserAgent()}
+}
+
+func requestIPAddress(c *gin.Context) string {
+	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err != nil {
+		host = c.Request.RemoteAddr
+	}
+	if net.ParseIP(host) == nil {
+		return ""
+	}
+	return host
+}
+
+func writeError(c *gin.Context, status int, code, message string) {
+	c.JSON(status, ErrorResponse{Error: APIError{Code: code, Message: message}})
+}
+
 func extractToken(c *gin.Context) string {
-	authHeader := c.GetHeader("Authorization")
-	if authHeader == "" {
+	parts := strings.Fields(c.GetHeader("Authorization"))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		return ""
 	}
-
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return ""
-	}
-
 	return parts[1]
 }

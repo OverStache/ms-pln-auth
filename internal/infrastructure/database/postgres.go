@@ -3,6 +3,8 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"net"
+	"net/url"
 
 	_ "github.com/lib/pq"
 
@@ -11,27 +13,26 @@ import (
 
 // NewPostgresConnection creates a new PostgreSQL database connection
 func NewPostgresConnection(cfg config.DatabaseConfig) (*sql.DB, error) {
-	dsn := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host,
-		cfg.Port,
-		cfg.User,
-		cfg.Password,
-		cfg.DBName,
-		cfg.SSLMode,
-	)
+	connectionURL := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(cfg.User, cfg.Password),
+		Host:   net.JoinHostPort(cfg.Host, cfg.Port),
+		Path:   "/" + cfg.DBName,
+	}
+	query := url.Values{}
+	query.Set("sslmode", cfg.SSLMode)
+	connectionURL.RawQuery = query.Encode()
 
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open("postgres", connectionURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
 
-	// Test the connection
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Configure connection pool
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 

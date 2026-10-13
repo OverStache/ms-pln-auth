@@ -1,25 +1,28 @@
 package config
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// Config holds all configuration for the application
 type Config struct {
 	Server   ServerConfig
 	Database DatabaseConfig
 	Auth     AuthConfig
 }
 
-// ServerConfig holds server-related configuration
 type ServerConfig struct {
-	Port string
-	Mode string // "debug", "release", "test"
+	Port              string
+	Mode              string
+	TLSCertFile       string
+	TLSKeyFile        string
+	TrustedProxyCIDRs []string
 }
 
-// DatabaseConfig holds database-related configuration
 type DatabaseConfig struct {
 	Host     string
 	Port     string
@@ -29,18 +32,22 @@ type DatabaseConfig struct {
 	SSLMode  string
 }
 
-// AuthConfig holds authentication-related configuration
 type AuthConfig struct {
-	TokenDuration time.Duration
-	BcryptCost    int
+	AccessTokenDuration  time.Duration
+	RefreshTokenDuration time.Duration
+	BcryptCost           int
+	ActiveKeyID          string
+	JWTKeys              map[string][]byte
 }
 
-// Load loads configuration from environment variables with defaults
 func Load() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Port: getEnv("SERVER_PORT", "8080"),
-			Mode: getEnv("GIN_MODE", "debug"),
+			Port:              getEnv("SERVER_PORT", "8080"),
+			Mode:              getEnv("GIN_MODE", "debug"),
+			TLSCertFile:       getEnv("TLS_CERT_FILE", ""),
+			TLSKeyFile:        getEnv("TLS_KEY_FILE", ""),
+			TrustedProxyCIDRs: getStringListEnv("TRUSTED_PROXY_CIDRS"),
 		},
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
@@ -51,13 +58,81 @@ func Load() *Config {
 			SSLMode:  getEnv("DB_SSLMODE", "disable"),
 		},
 		Auth: AuthConfig{
-			TokenDuration: getDurationEnv("AUTH_TOKEN_DURATION", 24*time.Hour),
-			BcryptCost:    getIntEnv("AUTH_BCRYPT_COST", 10),
+			AccessTokenDuration:  getDurationEnv("AUTH_ACCESS_TOKEN_DURATION", 15*time.Minute),
+			RefreshTokenDuration: getDurationEnv("AUTH_REFRESH_TOKEN_DURATION", 7*24*time.Hour),
+			BcryptCost:           getIntEnv("AUTH_BCRYPT_COST", 12),
+			ActiveKeyID:          getEnv("JWT_ACTIVE_KID", "current"),
+			JWTKeys:              getJWTKeys(),
 		},
 	}
 }
 
-// getEnv gets an environment variable with a default value
+func (c ServerConfig) Validate() error {
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return fmt.Errorf("TLS_CERT_FILE and TLS_KEY_FILE must be configured together")
+	}
+	if c.Mode == "release" && c.TLSCertFile == "" && len(c.TrustedProxyCIDRs) == 0 {
+		return fmt.Errorf("release mode requires TLS_CERT_FILE/TLS_KEY_FILE or TRUSTED_PROXY_CIDRS for HTTPS termination")
+	}
+	for _, cidr := range c.TrustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid trusted proxy CIDR %q: %w", cidr, err)
+		}
+	}
+	return nil
+}
+
+func (c AuthConfig) Validate() error {
+	if c.AccessTokenDuration <= 0 || c.RefreshTokenDuration <= 0 {
+		return fmt.Errorf("access and refresh token durations must be positive")
+	}
+	if c.BcryptCost < 12 || c.BcryptCost > 31 {
+		return fmt.Errorf("AUTH_BCRYPT_COST must be between 12 and 31")
+	}
+	for id, key := range c.JWTKeys {
+		if strings.TrimSpace(id) == "" || len(key) < 32 {
+			return fmt.Errorf("JWT key ids must be non-empty and keys must contain at least 32 bytes")
+		}
+	}
+	if _, ok := c.JWTKeys[c.ActiveKeyID]; !ok {
+		return fmt.Errorf("JWT_ACTIVE_KID %q does not name a configured JWT key", c.ActiveKeyID)
+	}
+	return nil
+}
+
+func getJWTKeys() map[string][]byte {
+	keys := make(map[string][]byte)
+	configured := os.Getenv("JWT_KEYS")
+	if configured != "" {
+		for _, entry := range strings.Split(configured, ";") {
+			keyID, secret, ok := strings.Cut(entry, "=")
+			if ok {
+				keys[strings.TrimSpace(keyID)] = []byte(strings.TrimSpace(secret))
+			}
+		}
+		return keys
+	}
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		keys[getEnv("JWT_ACTIVE_KID", "current")] = []byte(secret)
+	}
+	return keys
+}
+
+func getStringListEnv(key string) []string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	items := strings.Split(value, ",")
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
 func getEnv(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
@@ -65,7 +140,6 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// getIntEnv gets an integer environment variable with a default value
 func getIntEnv(key string, defaultValue int) int {
 	if value, exists := os.LookupEnv(key); exists {
 		if intValue, err := strconv.Atoi(value); err == nil {
@@ -75,7 +149,6 @@ func getIntEnv(key string, defaultValue int) int {
 	return defaultValue
 }
 
-// getDurationEnv gets a duration environment variable with a default value
 func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 	if value, exists := os.LookupEnv(key); exists {
 		if duration, err := time.ParseDuration(value); err == nil {
